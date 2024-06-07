@@ -108,8 +108,7 @@ class OusterSensor : public OusterSensorNodeBase {
 
     uint8_t compose_config_flags(const sensor::sensor_config& config);
 
-    void configure_sensor(const std::string& hostname,
-                          sensor::sensor_config& config);
+    bool configure_sensor(const std::string& hostname, sensor::sensor_config& config);
 
     std::string load_config_file(const std::string& config_file);
 
@@ -185,6 +184,17 @@ class OusterSensor : public OusterSensorNodeBase {
     // TODO: add as a ros parameter
     const int max_read_imu_packet_errors = 60;
     int read_imu_packet_errors = 0;
+
+    // Reconnection parameters
+    void get_reconnection_configs();
+
+    ouster::sensor::sensor_config config_;
+    bool retry_configuration_ = true;
+    double retry_period_ = 10.0;
+    double lidar_timeout_ = 1.0;
+    bool had_reconnection_success_ = false;
+    rclcpp::Time lidar_data_rx_time_ = rclcpp::Time(0, 0);
+    bool reset_lidar_ = false;
 };
 
 }  // namespace ouster_ros

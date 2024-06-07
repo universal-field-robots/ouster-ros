@@ -60,19 +60,29 @@ void OusterSensor::declare_parameters() {
     declare_parameter("timestamp_mode", "");
     declare_parameter("udp_profile_lidar", "");
     declare_parameter("use_system_default_qos", false);
+    declare_parameter<bool>("retry_configuration", true);
+    declare_parameter<double>("retry_period", 10.0);
+    declare_parameter<double>("lidar_timeout", 1.0);
+}
+
+void OusterSensor::get_reconnection_configs(){
+    retry_configuration_ = get_parameter("retry_configuration").as_bool();
+    retry_period_ = get_parameter("retry_period").as_double();
+    lidar_timeout_ = get_parameter("lidar_timeout").as_double();
 }
 
 LifecycleNodeInterface::CallbackReturn OusterSensor::on_configure(
     const rclcpp_lifecycle::State&) {
     RCLCPP_DEBUG(get_logger(), "on_configure() is called.");
 
+    get_reconnection_configs();
     try {
         sensor_hostname = get_sensor_hostname();
-        auto config = staged_config.empty()
+        config_ = staged_config.empty()
                           ? parse_config_from_ros_parameters()
                           : parse_config_from_staged_config_string();
-        configure_sensor(sensor_hostname, config);
-        sensor_client = create_sensor_client(sensor_hostname, config);
+        configure_sensor(sensor_hostname, config_);
+        sensor_client = create_sensor_client(sensor_hostname, config_);
         if (!sensor_client)
             return LifecycleNodeInterface::CallbackReturn::FAILURE;
         create_metadata_publisher();
@@ -344,7 +354,7 @@ void OusterSensor::create_reset_service() {
         "reset", [this](const std::shared_ptr<std_srvs::srv::Empty::Request>,
                         std::shared_ptr<std_srvs::srv::Empty::Response>) {
             RCLCPP_INFO(get_logger(), "reset service invoked");
-            reset_sensor(true);
+            reset_lidar_ = true;
         });
 
     RCLCPP_INFO(get_logger(), "reset service created");
@@ -579,25 +589,44 @@ uint8_t OusterSensor::compose_config_flags(
     return config_flags;
 }
 
-void OusterSensor::configure_sensor(const std::string& hostname,
+bool OusterSensor::configure_sensor(const std::string& hostname,
                                     sensor::sensor_config& config) {
-    if (config.udp_dest && sensor::in_multicast(config.udp_dest.value()) &&
-        !mtp_main) {
-        if (!get_config(hostname, config, true)) {
-            RCLCPP_ERROR(get_logger(), "Error getting active config");
+    bool is_configured = false;
+    do {
+        if (config.udp_dest && sensor::in_multicast(config.udp_dest.value()) &&
+            !mtp_main) {
+            if (!get_config(hostname, config, true)) {
+                RCLCPP_ERROR(get_logger(), "Error getting active config");
+            } else {
+                RCLCPP_INFO(get_logger(), "Retrived active config of sensor");
+            }
         } else {
-            RCLCPP_INFO(get_logger(), "Retrived active config of sensor");
+            try {
+                uint8_t config_flags = compose_config_flags(config);
+                if (!set_config(hostname, config, config_flags)) {
+                    throw std::runtime_error("Error connecting to sensor " + hostname);
+                }
+                is_configured = true;
+                break;
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, 
+                "Error setting config: %s", e.what());
+            }
         }
-        return;
+        if (retry_configuration_) {
+            RCLCPP_WARN(get_logger(), "Sensor failed to configure, retrying in %f seconds", retry_period_);
+            std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(retry_period_ * 1000)));
+        }
+    } while (!is_configured && retry_configuration_);
+
+    if (is_configured) {
+        RCLCPP_INFO_STREAM(get_logger(), "Sensor " << hostname << " configured successfully");
+    } else {
+        RCLCPP_INFO_STREAM_THROTTLE(get_logger(), *get_clock(), 
+        1000, "Sensor " << hostname << " failed to configure");
     }
 
-    uint8_t config_flags = compose_config_flags(config);
-    if (!set_config(hostname, config, config_flags)) {
-        throw std::runtime_error("Error connecting to sensor " + hostname);
-    }
-
-    RCLCPP_INFO_STREAM(get_logger(),
-                       "Sensor " << hostname << " configured successfully");
+    return is_configured;
 }
 
 // fill in values that could not be parsed from metadata
@@ -707,12 +736,13 @@ void OusterSensor::handle_lidar_packet(sensor::client& cli,
     lidar_packets->write_overwrite([this, &cli, pf](uint8_t* buffer) {
         bool success = sensor::read_lidar_packet(cli, buffer, pf);
         if (success) {
+            had_reconnection_success_ = false;
+            lidar_data_rx_time_ = rclcpp::Clock(RCL_ROS_TIME).now();
             read_lidar_packet_errors = 0;
             if (!is_legacy_lidar_profile(info) && init_id_changed(pf, buffer)) {
                 // TODO: short circuit reset if no breaking changes occured?
                 RCLCPP_WARN(get_logger(),
-                            "sensor init_id has changed! reactivating..");
-                reactivate_sensor();
+                            "Sensor init_id has changed, potentially breaking connection");
             }
         } else {
             if (++read_lidar_packet_errors > max_read_lidar_packet_errors) {
@@ -745,6 +775,7 @@ void OusterSensor::handle_imu_packet(sensor::client& cli,
 }
 
 void OusterSensor::cleanup() {
+    //! Node hangs when called
     sensor_client.reset();
     lidar_packet_pub.reset();
     imu_packet_pub.reset();
@@ -768,8 +799,17 @@ void OusterSensor::connection_loop(sensor::client& cli,
         return;
     }
     poll_client_error_count = 0;
-    if (state & sensor::LIDAR_DATA) {
+    if (state & sensor::LIDAR_DATA && !reset_lidar_) {
         handle_lidar_packet(cli, pf);
+    } else if (!had_reconnection_success_ && retry_configuration_ && 
+        (lidar_data_rx_time_.seconds() != (rclcpp::Time(0, 0).seconds())) &&
+        (rclcpp::Clock(RCL_ROS_TIME).now().seconds() - lidar_data_rx_time_.seconds() > lidar_timeout_)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "poll_client disconnected, attempting reconnection");
+        had_reconnection_success_ = configure_sensor(get_sensor_hostname(), config_);
+        if (had_reconnection_success_) {
+            sensor_client = create_sensor_client(get_sensor_hostname(), config_);
+        }
+        reset_lidar_ = false;
     }
     if (state & sensor::IMU_DATA) {
         handle_imu_packet(cli, pf);
