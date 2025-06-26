@@ -38,6 +38,8 @@ OusterSensor::OusterSensor(const std::string& name,
         get_parameter("dormant_period_between_reconnects").as_double();
     reconnect_attempts_available =
         get_parameter("max_failed_reconnect_attempts").as_int();
+    max_poll_client_error_count =
+        get_parameter("max_poll_client_error_count").as_int();
 
     bool auto_start = get_parameter("auto_start").as_bool();
 
@@ -83,6 +85,7 @@ void OusterSensor::declare_parameters() {
     declare_parameter("dormant_period_between_reconnects", 1.0);
     declare_parameter("max_failed_reconnect_attempts", INT_MAX);
     declare_parameter("auto_start", false);
+    declare_parameter("max_poll_client_error_count", 60);
 }
 
 bool OusterSensor::start() {
@@ -723,7 +726,9 @@ bool OusterSensor::init_id_changed(const sensor::packet_format& pf,
 }
 
 void OusterSensor::handle_poll_client_error() {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 100,
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 100,
+                         "sensor::poll_client()) returned error or timed out");
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
                          "sensor::poll_client()) returned error or timed out");
     // in case error continues for a while attempt to recover by
     // performing sensor reset

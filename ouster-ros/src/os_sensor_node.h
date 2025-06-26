@@ -162,8 +162,7 @@ class OusterSensor : public OusterSensorNodeBase {
     bool reset_last_init_id = true;
     std::optional<uint32_t> last_init_id;
 
-    // TODO: add as a ros parameter
-    const int max_poll_client_error_count = 10;
+    int max_poll_client_error_count = 60;
     int poll_client_error_count = 0;
     // TODO: add as a ros parameter
     const int max_read_lidar_packet_errors = 60;
